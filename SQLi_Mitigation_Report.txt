@@ -1,0 +1,4 @@
+2025-11-06 17:06:01,383 - RecordManager: WARNING  PATIENT ACCESS FAIL: User 'Attacker_User' attempted access to non-existent Record ID: 1 OR 1=1.
+  [SUCCESS] SQL Injection attempt failed successfully.
+  The system searched for literal ID: '1 OR 1=1' and found nothing.
+2025-11-06 17:06:01,383 - RecordManager: CRITICAL SQLI ASSURANCE TEST: Attack attempt by 'Attacker_User' with payload '1 OR 1=1' FAILED (Mitigation Proof).
