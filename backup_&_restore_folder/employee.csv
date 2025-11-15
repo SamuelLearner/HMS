@@ -1,3 +1,4 @@
+User_Name,Full_Name,Email,Birth_Date,Password_Hash,Role,Assigned_Doctor_ID,Salary,Status
 lfb,Lefty Blease,lblease0@tiny.cc,1980-02-01,bf6xP,Receptionist,hpt,4000,Logged In
 rbn,Rockey Brignall,rbrignall1@bigcartel.com,1980-02-02,Z5iUz,Receptionist,hpt,4000,Logged In
 jch,Jayson Chapelhow,jchapelhow2@vimeo.com,1980-02-03,K2Yja,Cleaner,hpt,2000,Logged In

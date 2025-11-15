@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud Patient Management System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for aesthetic */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fb;
+        }
+        .card {
+            background-color: white;
+            border-radius: 1rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+        .header-bg {
+            background-color: #1f2937; /* Darker background for header */
+        }
+        .btn-primary {
+            background-color: #10b981; /* Emerald green */
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            transition: background-color 0.2s;
+        }
+        .btn-primary:hover {
+            background-color: #059669;
+        }
+        .btn-danger {
+            background-color: #ef4444; /* Red */
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            transition: background-color 0.2s;
+        }
+        .btn-danger:hover {
+            background-color: #dc2626;
+        }
+        .modal-backdrop {
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+        /* Custom scrollbar for data table */
+        #patient-list-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        #patient-list-container::-webkit-scrollbar-thumb {
+            background-color: #d1d5db;
+            border-radius: 10px;
+        }
+    </style>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, deleteDoc, updateDoc, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL VARIABLES & INITIALIZATION ---
+        
+        // 1. Get Environment Variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // 2. Safely parse and provide a fallback if the config variable isn't available (i.e., when running locally)
+        let firebaseConfig = {};
+        try {
+            // Try to use the provided config (works in the online editor)
+            firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        } catch (e) {
+            console.warn("Could not parse __firebase_config. Using fallback config.");
+        }
+
+        // IMPORTANT FIX: If running locally and firebaseConfig is missing projectId, provide a minimal dummy config.
+        const isLocalMock = !firebaseConfig.projectId;
+
+        if (isLocalMock) {
+            console.warn("Firebase projectId missing. Using a dummy fallback to prevent initialization crash.");
+            firebaseConfig = {
+                apiKey: "dummy-api-key",
+                projectId: "dummy-project-id", 
+                authDomain: "dummy-auth-domain"
+            };
+        }
+        
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        const app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+
+        // Utility to get the correct collection reference (Public data)
+        const getPatientsCollection = () => {
+            if (!db || !userId) {
+                console.error("Firestore or User ID not ready.");
+                return null;
+            }
+            // All patient data is stored in a public collection under the artifact ID
+            return collection(db, 'artifacts', appId, 'public', 'data', 'patients');
+        };
+
+        // --- AUTHENTICATION & INITIAL SETUP ---
+
+        /**
+         * Authenticates the user using the custom token or anonymously, or mocks auth for local testing.
+         */
+        const authenticateUser = async () => {
+            if (isLocalMock) {
+                // --- LOCAL MOCK AUTH MODE ---
+                console.warn("Local Mock Mode: Bypassing Firebase Auth API calls.");
+                // Set a mock user ID and immediately mark as authenticated
+                userId = "MOCK_LOCAL_USER_ID";
+                document.getElementById('user-id-display').textContent = `User ID: ${userId} (MOCK)`;
+                isAuthReady = true;
+                // Since we're mocking, manually trigger the data listener setup
+                setupPatientDataListener();
+                return;
+            }
+
+            // --- REAL AUTH MODE ---
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    console.log("Signed in with custom token.");
+                } else {
+                    await signInAnonymously(auth);
+                    console.log("Signed in anonymously.");
+                }
+            } catch (error) {
+                // If custom token fails, it usually means the token itself is invalid or expired.
+                console.error("Authentication failed with custom token:", error.message);
+                try {
+                    await signInAnonymously(auth);
+                    console.log("Fallback: Signed in anonymously.");
+                } catch (anonError) {
+                    console.error("Anonymous sign-in failed:", anonError.message);
+                }
+            }
+        };
+
+        /**
+         * Listens for authentication state changes and sets up the listener for patient data.
+         * NOTE: This listener is primarily for the REAL AUTH flow. In MOCK mode, setupPatientDataListener is called directly.
+         */
+        onAuthStateChanged(auth, (user) => {
+            // Only proceed if not in local mock mode
+            if (!isLocalMock) { 
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                    isAuthReady = true;
+                    console.log("Auth state changed. User ID:", userId);
+                    // Once authenticated, start listening to the patient data
+                    setupPatientDataListener();
+                } else {
+                    isAuthReady = false;
+                    userId = null;
+                    document.getElementById('user-id-display').textContent = `User ID: Not Authenticated`;
+                    console.log("User signed out.");
+                }
+            }
+        });
+
+        // --- DATA OPERATIONS ---
+
+        let unsubscribePatients = null;
+
+        /**
+         * Sets up the real-time listener for the 'patients' collection.
+         */
+        const setupPatientDataListener = () => {
+            if (unsubscribePatients) {
+                unsubscribePatients(); // Unsubscribe previous listener if it exists
+            }
+            
+            // In local mock mode, we still try to get the ref, but firestore operations will fail
+            const patientsRef = getPatientsCollection();
+            if (!patientsRef) return;
+
+            // Simple query for all patients
+            const q = query(patientsRef); 
+
+            unsubscribePatients = onSnapshot(q, (snapshot) => {
+                const patients = [];
+                snapshot.forEach(doc => {
+                    patients.push({ id: doc.id, ...doc.data() });
+                });
+                renderPatientList(patients);
+            }, (error) => {
+                console.error("Error listening to patient data (If running locally, this is expected):", error);
+                // Only display error if we are not in mock mode (i.e., should be connected)
+                if (!isLocalMock) {
+                    displayMessage("Failed to load patient data.", 'error');
+                }
+            });
+        };
+
+        /**
+         * Adds a new patient record to Firestore.
+         * @param {object} patientData - The data for the new patient.
+         */
+        const addPatient = async (patientData) => {
+            const patientsRef = getPatientsCollection();
+            if (!patientsRef) {
+                 displayMessage("Firestore is not ready. Please check authentication.", 'error');
+                 return;
+            }
+
+            try {
+                const docRef = await addDoc(patientsRef, {
+                    ...patientData,
+                    created_at: new Date().toISOString()
+                });
+                displayMessage(`Patient added successfully (ID: ${docRef.id}).`, 'success');
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                // Give a clear message if it fails locally
+                if (isLocalMock) {
+                    displayMessage("Cannot save patient in local mock mode. Please deploy to use Firestore.", 'error');
+                } else {
+                    displayMessage("Failed to add patient. Check console for details.", 'error');
+                }
+            }
+        };
+
+        /**
+         * Updates an existing patient record in Firestore.
+         * @param {string} patientId - The ID of the patient document.
+         * @param {object} updates - The fields to update.
+         */
+        const updatePatient = async (patientId, updates) => {
+            const patientDocRef = doc(getPatientsCollection(), patientId);
+             if (!patientDocRef) {
+                 displayMessage("Firestore is not ready. Please check authentication.", 'error');
+                 return;
+            }
+            try {
+                await updateDoc(patientDocRef, updates);
+                displayMessage(`Patient ${patientId} updated successfully.`, 'success');
+            } catch (e) {
+                console.error("Error updating document: ", e);
+                if (isLocalMock) {
+                    displayMessage("Cannot update patient in local mock mode. Please deploy to use Firestore.", 'error');
+                } else {
+                    displayMessage("Failed to update patient. Check console for details.", 'error');
+                }
+            }
+        };
+
+        /**
+         * Deletes a patient record from Firestore.
+         * @param {string} patientId - The ID of the patient document to delete.
+         */
+        const deletePatient = async (patientId) => {
+            const patientDocRef = doc(getPatientsCollection(), patientId);
+             if (!patientDocRef) {
+                 displayMessage("Firestore is not ready. Please check authentication.", 'error');
+                 return;
+            }
+            try {
+                await deleteDoc(patientDocRef);
+                displayMessage(`Patient ${patientId} deleted successfully.`, 'success');
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+                if (isLocalMock) {
+                    displayMessage("Cannot delete patient in local mock mode. Please deploy to use Firestore.", 'error');
+                } else {
+                    displayMessage("Failed to delete patient. Check console for details.", 'error');
+                }
+            }
+        };
+        
+        // --- KIVY DATA IMPORT LOGIC (REAL MIGRATION) ---
+
+        /**
+         * Imports mock/placeholder data to simulate importing from the old Kivy system.
+         */
+        const importOldKivyData = async () => {
+            
+            // This is MOCK DATA structured to look like your old Kivy records.
+            // **NOTE:** In a real migration, you would replace this array with data loaded from your Kivy system's DB/file.
+            const mockKivyRecords = [
+                // Patient 1
+                { old_id: 'K1001', patient_name: 'John Doe', age: 45, phone: '555-1234', diagnosis: 'Hypertension', last_visit: '2025-05-10', created_by: 'admin1' },
+                // Patient 2 (Your screenshot data: Samuel Peter Ocampo)
+                { old_id: 'K1002', patient_name: 'Samuel Peter Ocampo', age: 21, phone: '555-9999', diagnosis: 'Skibidi', last_visit: '2025-11-15', created_by: 'admin1', health_condition: 'Asthma' },
+                // Patient 3
+                { old_id: 'K1003', patient_name: 'Jane Smith', age: 32, phone: '555-5678', diagnosis: 'Type 2 Diabetes', last_visit: '2025-06-15', created_by: 'doctorA' },
+            ];
+
+            const patientsRef = getPatientsCollection();
+            if (!patientsRef) {
+                displayMessage("Database not ready for import. Authentication required.", 'error');
+                return;
+            }
+            
+            displayMessage("Starting data migration from old system...", 'info');
+            document.getElementById('import-button').disabled = true;
+
+            // 1. Map Old Data to New Cloud Structure
+            const newPatientData = mockKivyRecords.map(record => ({
+                // Use the old ID as the new ID, but ensure we use a different field name for the patient name
+                id: record.old_id, 
+                name: record.patient_name,
+                age: record.age,
+                phone: record.phone,
+                diagnosis: record.diagnosis,
+                last_visit: record.last_visit,
+                health_condition: record.health_condition || 'N/A',
+                // Meta data for tracking source
+                created_by_old_system: record.created_by,
+                created_at: new Date().toISOString(),
+                imported: true 
+            }));
+
+            // 2. Check for existing data
+            const snapshot = await getDocs(patientsRef);
+            if (!snapshot.empty) {
+                // If there's existing data, ask for confirmation before potentially adding duplicates
+                showConfirmationModal("Existing Data Found", "Data already exists in the cloud system. **Do you want to proceed and import the data again?** This may create duplicates.", async () => {
+                    await performImport(newPatientData, patientsRef);
+                });
+                document.getElementById('import-button').disabled = false;
+                return;
+            }
+
+            // 3. Perform the migration if no existing data or confirmation is given
+            await performImport(newPatientData, patientsRef);
+        };
+
+        /**
+         * Executes the import process by adding all records.
+         */
+        const performImport = async (data, patientsRef) => {
+            let successCount = 0;
+            let errorCount = 0;
+            
+            for (const patient of data) {
+                try {
+                    // Use addDoc to create new documents in the Firestore collection
+                    // Note: Firestore auto-generates the ID for addDoc. We are using the old_id for display purposes.
+                    await addDoc(patientsRef, patient); 
+                    successCount++;
+                } catch (e) {
+                    errorCount++;
+                    console.error("Error importing patient:", patient.id, e);
+                }
+            }
+
+            if (successCount > 0) {
+                 displayMessage(`Migration complete! ${successCount} patients successfully migrated to the cloud.`, 'success');
+            } else if (errorCount > 0 && isLocalMock) {
+                displayMessage(`Import failed for ${errorCount} records. This is expected in local mode. Please deploy to complete the migration.`, 'error');
+            } else {
+                displayMessage("Migration finished, but no records were added.", 'warning');
+            }
+            
+            document.getElementById('import-button').disabled = false;
+        }
+
+        // --- UI RENDERING AND EVENT HANDLERS ---
+
+        /**
+         * Renders the list of patients in the table.
+         * @param {Array<object>} patients - The array of patient objects.
+         */
+        const renderPatientList = (patients) => {
+            const container = document.getElementById('patient-list-container');
+            const tbody = container.querySelector('tbody');
+            
+            // Sort by ID for consistent display
+            patients.sort((a, b) => (a.id > b.id) ? 1 : -1);
+
+            tbody.innerHTML = ''; 
+
+            if (patients.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" class="py-4 text-center text-gray-500">No patient records found. Start by adding a new patient or migrating data.</td></tr>`;
+                // Ensure buttons are clickable even if list is empty
+                document.getElementById('import-button').disabled = false;
+                document.getElementById('add-patient-btn').disabled = false;
+                return;
+            }
+            
+            // Re-enable buttons if data is successfully loaded
+            document.getElementById('import-button').disabled = false;
+            document.getElementById('add-patient-btn').disabled = false;
+
+
+            patients.forEach(patient => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-b hover:bg-gray-50';
+                
+                // Ensure default values for display if fields are missing
+                const patientId = patient.id || 'N/A';
+                const patientName = patient.name || 'N/A';
+                const patientAge = patient.age || 'N/A';
+                const patientPhone = patient.phone || 'N/A';
+                // Using 'diagnosis' as the main displayed field, which includes the Kivy 'Skibidi' entry
+                const patientDiagnosis = patient.diagnosis || 'N/A'; 
+                const lastVisitDate = patient.last_visit ? new Date(patient.last_visit).toLocaleDateString() : 'N/A';
+
+                tr.innerHTML = `
+                    <td class="p-4">${patientId}</td>
+                    <td class="p-4 font-medium">${patientName}</td>
+                    <td class="p-4">${patientAge}</td>
+                    <td class="p-4">${patientPhone}</td>
+                    <td class="p-4 text-sm">${patientDiagnosis}</td>
+                    <td class="p-4 text-sm">${lastVisitDate}</td>
+                    <td class="p-4 flex space-x-2">
+                        <button data-id="${patient.id}" data-action="edit" class="text-blue-600 hover:text-blue-800 font-semibold text-sm">Edit</button>
+                        <button data-id="${patient.id}" data-action="delete" class="text-red-600 hover:text-red-800 font-semibold text-sm">Delete</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+            
+            // Re-attach listeners for the action buttons
+            tbody.querySelectorAll('button[data-action="edit"]').forEach(button => {
+                button.addEventListener('click', () => editPatientHandler(button.dataset.id, patients.find(p => p.id === button.dataset.id)));
+            });
+
+            tbody.querySelectorAll('button[data-action="delete"]').forEach(button => {
+                button.addEventListener('click', () => deletePatientHandler(button.dataset.id, patients.find(p => p.id === button.dataset.id).name));
+            });
+        };
+
+        /**
+         * Handles the click on the 'Add New Patient' button.
+         */
+        const addNewPatientHandler = () => {
+            const modal = document.getElementById('patient-modal');
+            const title = document.getElementById('modal-title');
+            const form = document.getElementById('patient-form');
+            const submitButton = document.getElementById('submit-patient-btn');
+
+            title.textContent = 'Add New Patient Record';
+            form.reset();
+            form.dataset.mode = 'add';
+            form.dataset.patientId = '';
+            submitButton.textContent = 'Add Patient';
+            
+            // Clear all fields
+            document.getElementById('patient-id').value = '';
+            document.getElementById('patient-name').value = '';
+            document.getElementById('patient-age').value = '';
+            document.getElementById('patient-phone').value = '';
+            document.getElementById('patient-diagnosis').value = '';
+            document.getElementById('patient-last-visit').value = '';
+            document.getElementById('patient-health-condition').value = '';
+
+
+            modal.classList.remove('hidden');
+        };
+
+        /**
+         * Handles the click on the 'Edit' button.
+         */
+        const editPatientHandler = (id, patient) => {
+            const modal = document.getElementById('patient-modal');
+            const title = document.getElementById('modal-title');
+            const form = document.getElementById('patient-form');
+            const submitButton = document.getElementById('submit-patient-btn');
+
+            title.textContent = `Edit Patient Record: ${patient.name}`;
+            form.dataset.mode = 'edit';
+            form.dataset.patientId = id;
+            submitButton.textContent = 'Save Changes';
+
+            // Populate form fields
+            document.getElementById('patient-id').value = patient.id || '';
+            document.getElementById('patient-name').value = patient.name || '';
+            document.getElementById('patient-age').value = patient.age || '';
+            document.getElementById('patient-phone').value = patient.phone || '';
+            document.getElementById('patient-diagnosis').value = patient.diagnosis || '';
+            document.getElementById('patient-health-condition').value = patient.health_condition || '';
+            // Firestore stores dates as ISO strings, extract the date part for the input field
+            const lastVisitValue = patient.last_visit ? new Date(patient.last_visit).toISOString().split('T')[0] : '';
+            document.getElementById('patient-last-visit').value = lastVisitValue;
+            
+            modal.classList.remove('hidden');
+        };
+
+        /**
+         * Handles the form submission for adding/editing a patient.
+         */
+        const handleFormSubmit = async (event) => {
+            event.preventDefault();
+            
+            const form = event.target;
+            const patientId = form.dataset.patientId;
+            const mode = form.dataset.mode;
+
+            const ageValue = document.getElementById('patient-age').value;
+
+            const patientData = {
+                id: document.getElementById('patient-id').value.trim(),
+                name: document.getElementById('patient-name').value.trim(),
+                age: parseInt(ageValue, 10), // Ensure age is a number
+                phone: document.getElementById('patient-phone').value.trim(),
+                diagnosis: document.getElementById('patient-diagnosis').value.trim(),
+                health_condition: document.getElementById('patient-health-condition').value.trim(),
+                last_visit: document.getElementById('patient-last-visit').value.trim()
+            };
+
+            // Simple validation
+            if (!patientData.id || !patientData.name || isNaN(patientData.age) || patientData.age <= 0) {
+                displayMessage("Patient ID, Name, and a valid Age are required.", 'warning');
+                return;
+            }
+
+            closeModal('patient-modal');
+
+            if (mode === 'add') {
+                await addPatient(patientData);
+            } else if (mode === 'edit') {
+                await updatePatient(patientId, patientData);
+            }
+        };
+
+        /**
+         * Handles the click on the 'Delete' button.
+         */
+        const deletePatientHandler = (id, name) => {
+            showConfirmationModal("Confirm Deletion", `Are you sure you want to permanently delete the record for patient **${name}** (ID: ${id})? This action cannot be undone.`, async () => {
+                await deletePatient(id);
+            });
+        };
+
+
+        // --- MODAL AND MESSAGE UTILITIES ---
+
+        let confirmationCallback = null;
+
+        /**
+         * Shows the general confirmation modal.
+         * @param {string} title - The title of the modal.
+         * @param {string} message - The HTML content of the message.
+         * @param {function} callback - The function to execute on confirmation.
+         */
+        const showConfirmationModal = (title, message, callback) => {
+            const modal = document.getElementById('confirmation-modal');
+            document.getElementById('confirmation-title').textContent = title;
+            document.getElementById('confirmation-message').innerHTML = message;
+            confirmationCallback = callback;
+            modal.classList.remove('hidden');
+        };
+
+        /**
+         * Handles the confirmation (Yes) button click.
+         */
+        const handleConfirm = () => {
+            if (confirmationCallback) {
+                confirmationCallback();
+            }
+            closeModal('confirmation-modal');
+        };
+
+        /**
+         * Closes a modal by its ID.
+         * @param {string} modalId - The ID of the modal to close.
+         */
+        const closeModal = (modalId) => {
+            document.getElementById(modalId).classList.add('hidden');
+        };
+
+        /**
+         * Displays temporary message feedback to the user.
+         * @param {string} message - The message text.
+         * @param {('success'|'error'|'warning'|'info')} type - The type of message.
+         */
+        const displayMessage = (message, type) => {
+            const toast = document.getElementById('toast-message');
+            toast.textContent = message;
+            
+            // Set colors based on type
+            let bgColor = '';
+            switch (type) {
+                case 'success': bgColor = 'bg-green-500'; break;
+                case 'error': bgColor = 'bg-red-500'; break;
+                case 'warning': bgColor = 'bg-yellow-500'; break;
+                case 'info': bgColor = 'bg-blue-500'; break;
+                default: bgColor = 'bg-gray-500'; break;
+            }
+            
+            toast.className = `fixed bottom-5 right-5 p-4 rounded-lg shadow-xl text-white transition-opacity ${bgColor}`;
+            toast.classList.remove('opacity-0', 'pointer-events-none');
+            toast.classList.add('opacity-100');
+
+            setTimeout(() => {
+                toast.classList.remove('opacity-100');
+                toast.classList.add('opacity-0', 'pointer-events-none');
+            }, 5000);
+        };
+
+        // --- INITIALIZATION ---
+        window.onload = () => {
+            // Attach main event listeners
+            document.getElementById('add-patient-btn').addEventListener('click', addNewPatientHandler);
+            document.getElementById('import-button').addEventListener('click', importOldKivyData);
+            document.getElementById('patient-form').addEventListener('submit', handleFormSubmit);
+            
+            // Modal close listeners
+            document.querySelectorAll('[data-close-modal]').forEach(element => {
+                element.addEventListener('click', (e) => closeModal(e.target.dataset.closeModal));
+            });
+            
+            // Confirmation modal handlers
+            document.getElementById('confirm-yes').addEventListener('click', handleConfirm);
+            document.getElementById('confirm-no').addEventListener('click', () => closeModal('confirmation-modal'));
+
+            // Start authentication process
+            authenticateUser();
+        };
+
+        // Export utility functions for potential direct console use (optional)
+        window.addPatient = addPatient;
+        window.updatePatient = updatePatient;
+        window.deletePatient = deletePatient;
+        window.importOldKivyData = importOldKivyData;
+
+    </script>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <!-- Toast Notification -->
+    <div id="toast-message" class="fixed bottom-5 right-5 p-4 rounded-lg shadow-xl text-white transition-opacity duration-300 opacity-0 pointer-events-none z-50"></div>
+
+    <!-- Header Section -->
+    <header class="header-bg p-6 card mb-8">
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center">
+            <h1 class="text-3xl font-extrabold text-white">
+                <span class="text-[#10b981]">Cloud</span> Patient Management
+            </h1>
+            <p id="user-id-display" class="mt-2 sm:mt-0 text-sm text-gray-300">User ID: ...</p>
+        </div>
+        <p class="text-gray-400 mt-1">Real-time patient records powered by Google Firestore.</p>
+    </header>
+
+    <!-- Main Content -->
+    <main class="space-y-6">
+        <!-- Control Panel -->
+        <div class="flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-4">
+            <button id="add-patient-btn" class="btn-primary w-full sm:w-auto font-bold shadow-lg flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" />
+                </svg>
+                Add New Patient
+            </button>
+            <button id="import-button" class="btn-primary w-full sm:w-auto bg-yellow-600 hover:bg-yellow-700 font-bold shadow-lg flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M4 4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V8a2 2 0 00-2-2h-5L9 4H4z" />
+                </svg>
+                Migrate Old Data Now
+            </button>
+        </div>
+
+        <!-- Patient List Table -->
+        <div class="card overflow-hidden">
+            <div id="patient-list-container" class="overflow-x-auto max-h-[70vh] w-full">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50 sticky top-0">
+                        <tr>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Patient ID</th>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Age</th>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Phone</th>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Diagnosis</th>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Visit</th>
+                            <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <!-- Patient rows will be inserted here by JavaScript -->
+                        <tr><td colspan="7" class="py-4 text-center text-gray-500">Loading data...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <!-- Patient Add/Edit Modal -->
+    <div id="patient-modal" class="hidden fixed inset-0 z-50 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="modal-backdrop absolute inset-0" data-close-modal="patient-modal"></div>
+            <div class="card w-full max-w-lg p-6 relative z-10 transform transition-all">
+                <h3 id="modal-title" class="text-xl font-bold mb-4 text-gray-800">Add New Patient Record</h3>
+                <form id="patient-form" data-mode="add" data-patient-id="">
+                    <div class="space-y-4">
+                        <div>
+                            <label for="patient-id" class="block text-sm font-medium text-gray-700">Patient ID (Unique)</label>
+                            <input type="text" id="patient-id" name="id" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                        </div>
+                        <div>
+                            <label for="patient-name" class="block text-sm font-medium text-gray-700">Name</label>
+                            <input type="text" id="patient-name" name="name" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                        </div>
+                        <div>
+                            <label for="patient-age" class="block text-sm font-medium text-gray-700">Age</label>
+                            <input type="number" id="patient-age" name="age" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                        </div>
+                        <div>
+                            <label for="patient-phone" class="block text-sm font-medium text-gray-700">Phone</label>
+                            <input type="tel" id="patient-phone" name="phone" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                        </div>
+                        <div>
+                            <label for="patient-diagnosis" class="block text-sm font-medium text-gray-700">Diagnosis/Notes</label>
+                            <textarea id="patient-diagnosis" name="diagnosis" rows="2" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border"></textarea>
+                        </div>
+                        <div>
+                            <label for="patient-health-condition" class="block text-sm font-medium text-gray-700">Health Condition (From Old App)</label>
+                            <input type="text" id="patient-health-condition" name="health_condition" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                        </div>
+                        <div>
+                            <label for="patient-last-visit" class="block text-sm font-medium text-gray-700">Last Visit Date</label>
+                            <input type="date" id="patient-last-visit" name="last_visit" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                        </div>
+                    </div>
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button type="button" class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300" data-close-modal="patient-modal">
+                            Cancel
+                        </button>
+                        <button type="submit" id="submit-patient-btn" class="btn-primary text-sm font-medium">
+                            Add Patient
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div id="confirmation-modal" class="hidden fixed inset-0 z-50 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen p-4">
+            <div class="modal-backdrop absolute inset-0" data-close-modal="confirmation-modal"></div>
+            <div class="card w-full max-w-sm p-6 relative z-10 transform transition-all">
+                <h3 id="confirmation-title" class="text-xl font-bold mb-4 text-red-600">Confirm Action</h3>
+                <p id="confirmation-message" class="text-gray-700 mb-6">Are you sure you want to proceed?</p>
+                <div class="flex justify-end space-x-3">
+                    <button type="button" id="confirm-no" class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300">
+                        No, Cancel
+                    </button>
+                    <button type="button" id="confirm-yes" class="btn-danger text-sm font-medium">
+                        Yes, Proceed
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

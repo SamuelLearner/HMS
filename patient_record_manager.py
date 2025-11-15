@@ -1,222 +1,282 @@
 import sqlite3
-import logging
 import os
+import csv
 from cryptography.fernet import Fernet
-from datetime import datetime
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import base64
+import json
 
-# --- CONFIGURATION AND AUDIT LOGGING SETUP (Control: Audit Logging) ---
-LOG_FILE = 'audit.log'
-DB_FILE = 'patients.db'
+# --- GLOBAL CONFIGURATION AND SECURITY INITIALIZATION ---
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filename=LOG_FILE,
-    filemode='a' 
-)
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)-12s: %(levelname)-8s %(message)s')
-console.setFormatter(formatter)
-logging.getLogger('').addHandler(console)
+# Defaults in case constants.csv is missing or corrupt
+CONSTANTS = {
+    'SYSTEM_TITLE': 'Default Hospital System',
+    'MASTER_KEY': 'a-default-key-that-should-be-replaced-by-a-file-value'
+}
 
-logger = logging.getLogger('RecordManager')
-logger.info("SYSTEM INITIALIZED: Application started and Audit Logging system is active.")
+DB_NAME = 'patients.db'
+AUTH_DB_NAME = 'users.db'
+ENCRYPTION_KEY = None
+FERNET_CRYPTO = None
 
+# --- DATABASE SETUP ---
 
-# --- ENCRYPTION SETUP (Control: AES Encryption) ---
-KEY_FILE = 'fernet_key.key'
-def load_or_generate_key():
-    """Loads the key or generates a new one if it doesn't exist."""
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, 'rb') as f:
-            return f.read()
-    else:
-        key = Fernet.generate_key()
-        with open(KEY_FILE, 'wb') as f:
-            f.write(key)
-        logger.warning("NEW ENCRYPTION KEY GENERATED. SECURE THIS FILE!")
-        return key
+def setup_patient_db():
+    """Creates the patient records table if it doesn't exist."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS records (
+            record_id INTEGER PRIMARY KEY,
+            created_by TEXT NOT NULL,
+            patient_name TEXT NOT NULL,
+            encrypted_data BLOB NOT NULL,
+            date TEXT NOT NULL,
+            doctor TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-ENCRYPTION_KEY = load_or_generate_key()
-fernet = Fernet(ENCRYPTION_KEY)
+def setup_auth_db():
+    """Creates the users table and inserts default accounts."""
+    conn = sqlite3.connect(AUTH_DB_NAME)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL 
+        )
+    ''')
+    
+    # Insert default users (Admin, Doctor, Employee) if they don't exist
+    users = [
+        ('admin1', 'securepass', 'Admin'),
+        ('doc22', 'docpass', 'Doctor'),
+        ('emp33', 'emppass', 'Employee')
+    ]
+    
+    for user_id, password, role in users:
+        try:
+            c.execute("INSERT INTO users (user_id, password, role) VALUES (?, ?, ?)", 
+                      (user_id, password, role))
+        except sqlite3.IntegrityError:
+            # User already exists, ignore
+            pass
 
-def encrypt_record(data: str) -> bytes:
-    """Encrypts patient data before storage."""
-    return fernet.encrypt(data.encode('utf-8'))
+    conn.commit()
+    conn.close()
 
-def decrypt_record(token: bytes) -> str:
-    """Decrypts patient data after retrieval."""
+# --- INITIALIZATION FUNCTIONS ---
+
+def load_constants():
+    """Loads SYSTEM_TITLE and MASTER_KEY from constants.csv."""
+    global CONSTANTS
     try:
-        return fernet.decrypt(token).decode('utf-8')
+        with open('constants.csv', mode='r', newline='') as file:
+            reader = csv.reader(file)
+            # Skip header
+            next(reader, None)
+            for key, value in reader:
+                CONSTANTS[key.strip()] = value.strip()
+        print(f"[INFO] Constants loaded successfully.")
+    except FileNotFoundError:
+        print("[WARNING] Could not load constants from constants.csv (File not found). Using defaults.")
     except Exception as e:
-        logger.error(f"Failed to decrypt record: {e}. Possible tampering or key mismatch.")
-        return "[DECRYPTION FAILED]"
+        print(f"[WARNING] Could not load constants from constants.csv (CSV library error] {e}). Using defaults.")
 
-
-# --- USER MANAGEMENT LOGGING and DB FUNCTIONS (Unchanged) ---
-def authenticate_user(username, password_hash):
-    if username == "Dr.Smith" and password_hash == "secure_hash_123":
-        logger.info(f"AUTHENTICATION SUCCESS: User '{username}' logged in.")
-        return True
-    else:
-        logger.warning(f"AUTHENTICATION FAILURE: Failed login attempt for user '{username}'.")
-        return False
-
-def logout_user(username):
-    logger.info(f"SESSION END: User '{username}' logged out.")
+def initialize_security_and_db():
+    """Initializes encryption key, Fernet, and databases."""
+    global ENCRYPTION_KEY, FERNET_CRYPTO
     
-def initialize_db():
-    conn = None
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS patient_records (
-                id INTEGER PRIMARY KEY,
-                patient_name TEXT NOT NULL,
-                record_data BLOB NOT NULL,
-                created_at TEXT NOT NULL
-            );
-        ''')
-        conn.commit()
-        logger.info(f"Database initialized: {DB_FILE}.")
-    except sqlite3.Error as e:
-        logger.error(f"Database initialization error: {e}")
-    finally:
-        if conn:
-            conn.close()
+    # 1. Load Constants
+    load_constants()
 
-def add_record(patient_name: str, health_data: str, user_id="SYSTEM"):
-    conn = None
+    # 2. Derive Encryption Key from Master Key
+    master_key = CONSTANTS.get('MASTER_KEY').encode()
+    
+    # Use PBKDF2 to derive a strong 32-byte key from the master_key (password)
+    salt = b'a_fixed_salt_for_consistency'
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=480000,
+    )
+    # Fernet requires a base64 URL-safe key
+    key_32_bytes = kdf.derive(master_key)
+    ENCRYPTION_KEY = base64.urlsafe_b64encode(key_32_bytes)
+    
+    # 3. Initialize Fernet
     try:
-        encrypted_data = encrypt_record(health_data)
-        created_at = datetime.now().isoformat()
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        sql_insert = 'INSERT INTO patient_records (patient_name, record_data, created_at) VALUES (?, ?, ?);'
-        cursor.execute(sql_insert, (patient_name, encrypted_data, created_at))
+        FERNET_CRYPTO = Fernet(ENCRYPTION_KEY)
+        print("[INFO] Encryption key derived from MASTER_KEY constant.")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize Fernet encryption: {e}")
+        # Use a dummy key if initialization fails to prevent crash, but data will be garbage
+        FERNET_CRYPTO = Fernet(Fernet.generate_key()) 
+
+    # 4. Initialize Databases (Now the functions are defined above!)
+    setup_patient_db()
+    setup_auth_db()
+    
+    # 5. Final Success Message
+    print(f"SUCCESS: Security systems initialized. System Title: {CONSTANTS['SYSTEM_TITLE']}")
+
+
+def get_hospital_title():
+    """Public function to retrieve the system title."""
+    return CONSTANTS['SYSTEM_TITLE']
+
+# --- SECURITY AND DATA FUNCTIONS ---
+
+def authenticate_user(user_id, password):
+    """Checks user credentials against the authentication database."""
+    conn = sqlite3.connect(AUTH_DB_NAME)
+    c = conn.cursor()
+    
+    # Basic input sanitation (prevents common SQL injection)
+    if any(char in user_id for char in ['--', "'", '"', ';']):
+        print("SQLI ATTACK BLOCKED: Invalid characters in user_id.")
+        return None
+
+    c.execute("SELECT role FROM users WHERE user_id = ? AND password = ?", (user_id, password))
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return result[0] # Returns the role (e.g., 'Admin', 'Doctor')
+    return None
+
+def encrypt_record(data):
+    """Encrypts a dictionary of record data using Fernet."""
+    try:
+        # Convert dictionary to JSON string, encode to bytes, then encrypt
+        json_data = json.dumps(data)
+        return FERNET_CRYPTO.encrypt(json_data.encode())
+    except Exception as e:
+        print(f"[ENCRYPTION ERROR] Failed to encrypt data: {e}")
+        return None
+
+def decrypt_record(encrypted_data):
+    """Decrypts a bytes object into a dictionary of record data."""
+    try:
+        # Decrypt, decode bytes, then load the JSON string into a dictionary
+        decrypted_bytes = FERNET_CRYPTO.decrypt(encrypted_data)
+        json_data = decrypted_bytes.decode()
+        return json.loads(json_data)
+    except Exception as e:
+        print(f"[DECRYPTION ERROR] Failed to decrypt data. Key mismatch or data corruption: {e}")
+        return None
+
+def sanitize_input(data):
+    """Simple sanitation check for potentially malicious input."""
+    if isinstance(data, str) and any(char in data for char in ['--', "'", '"', ';']):
+        return "SQLI ATTACK BLOCKED"
+    return data
+
+# --- CRUD FUNCTIONS ---
+
+def add_record(user_id, patient_name, diagnosis, condition, date, doctor):
+    """Adds a new patient record to the database."""
+    
+    # Sanitize inputs before using them in SQL or data structure
+    patient_name = sanitize_input(patient_name)
+    diagnosis = sanitize_input(diagnosis)
+    condition = sanitize_input(condition)
+    date = sanitize_input(date)
+    doctor = sanitize_input(doctor)
+    
+    if patient_name == "SQLI ATTACK BLOCKED":
+        return None
+
+    # Data to be encrypted
+    sensitive_data = {
+        "Diagnosis": diagnosis,
+        "Health_Condition": condition,
+    }
+    
+    encrypted_data = encrypt_record(sensitive_data)
+    if not encrypted_data:
+        return None # Encryption failed
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            INSERT INTO records (created_by, patient_name, encrypted_data, date, doctor) 
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, patient_name, encrypted_data, date, doctor))
+        record_id = c.lastrowid
         conn.commit()
-        record_id = cursor.lastrowid
-        logger.info(f"PATIENT MODIFY: User '{user_id}' created record ID {record_id} for patient '{patient_name}'. (Action: CREATE)")
         return record_id
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error during record addition: {e}")
+    except Exception as e:
+        print(f"[DATABASE ERROR] Failed to add record: {e}")
+        return None
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
-def get_record(record_id: int, user_id="Dr.Smith"):
-    conn = None
+def get_record(user_id, record_id):
+    """Retrieves and decrypts a specific record."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Sanitize input
+    record_id = sanitize_input(record_id)
+    if record_id == "SQLI ATTACK BLOCKED":
+        return record_id
+        
     try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        sql_select = 'SELECT id, patient_name, record_data, created_at FROM patient_records WHERE id = ?;'
-        cursor.execute(sql_select, (record_id,)) 
-        result = cursor.fetchone()
+        c.execute("SELECT encrypted_data, patient_name, date, doctor FROM records WHERE record_id = ?", (record_id,))
+        result = c.fetchone()
+        conn.close()
+        
         if result:
-            record_id, name, encrypted_data, created_at = result
+            encrypted_data, patient_name, date, doctor = result
+            
+            # Decrypt sensitive data
             decrypted_data = decrypt_record(encrypted_data)
-            logger.info(f"PATIENT ACCESS: User '{user_id}' accessed record ID {record_id}, Name: {name}. (Action: READ)")
-            return {'id': record_id, 'name': name, 'data': decrypted_data, 'created_at': created_at}
-        else:
-            logger.warning(f"PATIENT ACCESS FAIL: User '{user_id}' attempted access to non-existent Record ID: {record_id}.")
-            return None
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error during record retrieval: {e}")
+            
+            if decrypted_data is None:
+                return None # Decryption failed
+            
+            # Combine non-sensitive and sensitive data
+            full_record = {
+                'Patient_Name': patient_name,
+                'Date': date,
+                'Doctor': doctor,
+            }
+            full_record.update(decrypted_data)
+            return full_record
+            
+    except Exception as e:
+        print(f"[DATABASE ERROR] Failed to retrieve record: {e}")
+        return None
     finally:
-        if conn:
-            conn.close()
-
-def update_record(record_id: int, new_data: str, user_id="Dr.Smith"):
-    conn = None
-    try:
-        encrypted_data = encrypt_record(new_data)
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        sql_update = 'UPDATE patient_records SET record_data = ? WHERE id = ?;'
-        cursor.execute(sql_update, (encrypted_data, record_id))
-        conn.commit()
-        if cursor.rowcount > 0:
-            logger.info(f"PATIENT MODIFY: User '{user_id}' updated record ID {record_id}.")
-            return True
-        else:
-            logger.warning(f"PATIENT MODIFY FAIL: User '{user_id}' failed to modify record. ID {record_id} not found.")
-            return False
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error during record update: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-def test_sql_injection_defense():
-    print("\n--- ASSURANCE TEST 1: SQL PARAMETERIZATION DEFENSE ---")
-    user_id = "Attacker_User"
-    malicious_id = "1 OR 1=1" 
-    result = get_record(malicious_id, user_id) 
-    if result is None:
-        print(f"  [SUCCESS] SQL Injection attempt failed successfully.")
-        print(f"  The system searched for literal ID: '{malicious_id}' and found nothing.")
-        logger.critical(f"SQLI ASSURANCE TEST: Attack attempt by '{user_id}' with payload '{malicious_id}' FAILED (Mitigation Proof).")
-    else:
-        print(f"  [FAILURE] SQL Injection attack was successful. This control is compromised.")
-        logger.critical(f"SQLI ASSURANCE TEST: Attack successful! Control Compromised.")
-        
-# --- NEW FUNCTION TO GET RAW ENCRYPTED DATA ---
-def display_raw_ciphertext(record_id: int):
-    """Retrieves the raw BLOB from the database, bypassing the decryption function."""
-    conn = None
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        sql_select = 'SELECT record_data FROM patient_records WHERE id = ?;'
-        cursor.execute(sql_select, (record_id,)) 
-        result = cursor.fetchone()
-        if result:
-            # Result is the raw encrypted bytes (BLOB)
-            return result[0]
-        return b""
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error during raw data retrieval: {e}")
-        return b""
-    finally:
-        if conn:
-            conn.close()
+        conn.close()
 
 
-# --- DEMONSTRATION (CALLING THE NEW FUNCTION) ---
-
-if __name__ == '__main__':
-    print("--- Running Secure Patient Record Demo (Functional Test) ---")
+def list_all_records():
+    """Lists all records with non-sensitive fields for the dashboard view."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT record_id, patient_name, date, doctor FROM records ORDER BY record_id DESC")
+    results = c.fetchall()
+    conn.close()
     
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
-        
-    if os.path.exists(LOG_FILE):
-        os.remove(LOG_FILE)
-        
-    initialize_db()
-    
-    # Functional tests (Logging, encryption, decryption)
-    authenticate_user("Dr.Smith", "secure_hash_123") 
-    record1_id = add_record("Tim Baker", "Diagnosis: Severe headache and fever.", user_id="Dr.Smith")
-    update_record(record1_id, "Diagnosis: Severe headache and fever. Treatment: Bed rest and fluids.", user_id="Dr.Smith")
-    
-    # Assurance Test 1: SQL Parameterization Defense
-    test_sql_injection_defense()
-    
-    # Assurance Test 2: AES ENCRYPTION RAW CIPHERTEXT PROOF
-    print("\n--- ASSURANCE TEST 2: AES ENCRYPTION (CIPHERTEXT PROOF) ---")
-    raw_bytes = display_raw_ciphertext(record1_id)
-    if raw_bytes:
-        print(f"  [SUCCESS] Raw Encrypted Data (Ciphertext) from DB:")
-        # This is the line that generates the critical evidence:
-        print(f"  {raw_bytes}") 
-        print(f"  Length: {len(raw_bytes)} bytes. Note: The raw data is unreadable, proving AES-256 protection.")
-    else:
-        print("  [FAILURE] Could not retrieve raw encrypted data.")
+    records = []
+    for row in results:
+        records.append({
+            'record_id': row[0],
+            'patient_name': row[1],
+            'date': row[2],
+            'doctor': row[3]
+        })
+    return records
 
-    logout_user("Dr.Smith")
-        
-    print(f"\n--- ALL ASSURANCE TESTS COMPLETE ---")
-    print(f"Copy the full console output for all three evidence requirements.")
+# --- RUN INITIALIZATION ---
+# This must be the last thing in the file to ensure all functions are defined first.
+initialize_security_and_db()

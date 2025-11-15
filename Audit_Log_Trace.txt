@@ -1,7 +1,0 @@
-2025-11-06 17:06:01,326 - RecordManager: INFO     SYSTEM INITIALIZED: Application started and Audit Logging system is active.
-2025-11-06 17:06:01,327 - RecordManager: WARNING  NEW ENCRYPTION KEY GENERATED. SECURE THIS FILE!
---- Running Secure Patient Record Demo (Functional Test) ---
-2025-11-06 17:06:01,348 - RecordManager: INFO     Database initialized: patients.db.
-2025-11-06 17:06:01,349 - RecordManager: INFO     AUTHENTICATION SUCCESS: User 'Dr.Smith' logged in.
-2025-11-06 17:06:01,372 - RecordManager: INFO     PATIENT MODIFY: User 'Dr.Smith' created record ID 1 for patient 'Tim Baker'. (Action: CREATE)
-2025-11-06 17:06:01,381 - RecordManager: INFO     PATIENT MODIFY: User 'Dr.Smith' updated record ID 1.
