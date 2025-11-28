@@ -42,603 +42,568 @@ def load_or_generate_key():
             f.write(key)
         return key
 
-# Initialize Fernet 
 try:
-    AES_KEY = load_or_generate_key()
-    fernet = Fernet(AES_KEY)
-except ImportError:
-    print("Warning: cryptography library not found. Using placeholder encryption.")
-    AES_KEY = None
-    fernet = None
+    KEY = load_or_generate_key()
+    CIPHER_SUITE = Fernet(KEY)
 except Exception as e:
-    print(f"Error initializing Fernet: {e}")
-    AES_KEY = None
-    fernet = None
-
-# --- ENCRYPTION/DECRYPTION FUNCTIONS ---
+    print(f"Error initializing encryption: {e}")
+    CIPHER_SUITE = None
 
 def encrypt_data(data):
-    if not data: return ""
-    if fernet:
+    """Encrypts a string (for PHI fields)."""
+    if CIPHER_SUITE:
+        return CIPHER_SUITE.encrypt(data.encode('utf-8'))
+    return data.encode('utf-8')
+
+def decrypt_data(token):
+    """Decrypts a Fernet token (bytes) back to a string."""
+    if CIPHER_SUITE:
         try:
-            return fernet.encrypt(data.encode('utf-8')).decode('utf-8')
+            return CIPHER_SUITE.decrypt(token).decode('utf-8')
         except Exception:
-            return f"ENC_{data}" 
-    return f"ENC_{data}"
+            # Handle cases where data might be unencrypted bytes
+            return token.decode('utf-8', errors='ignore') 
+    return token.decode('utf-8', errors='ignore')
 
-def decrypt_data(encrypted_data):
-    if not encrypted_data: return ""
-    if encrypted_data.startswith("ENC_"):
-        return encrypted_data.replace("ENC_", "")
-    if fernet:
-        try:
-            return fernet.decrypt(encrypted_data.encode('utf-8')).decode('utf-8')
-        except Exception:
-            return f"FAILED: {encrypted_data[:15]}..." 
-    return encrypted_data
+# --- Logging Functionality ---
+def setup_users_table():
+    conn = sqlite3.connect(PATIENT_DB_NAME)
+    cursor = conn.cursor()
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    """)
 
-# --- 3. DATABASE SETUP & AUDIT LOGGING ---
+    # Create default admin account if none exists
+    cursor.execute("SELECT * FROM users WHERE username = ?", ("admin",))
+    if not cursor.fetchone():
+        cursor.execute(
+            "INSERT INTO users (username, password) VALUES (?, ?)",
+            ("admin", "admin123")
+        )
+
+    conn.commit()
+    conn.close()
+
+# --- 3. DUAL DATABASE AUDIT LOGGING ---
+
+def setup_log_database():
+    """Initializes the separate audit log database."""
+    conn = sqlite3.connect(AUDIT_DB_NAME)
+    cursor = conn.cursor()
+    # Log table structure
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            timestamp TEXT NOT NULL,
+            user TEXT,
+            action TEXT,
+            target_id TEXT,
+            status TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def log_action(user, action, target_id="N/A", status=None):
+    """Records an action into the audit log database (Secure Insertion)."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(AUDIT_DB_NAME)
+    cursor = conn.cursor()
+    # Using parameterization for logging itself is best practice!
+    cursor.execute(
+        "INSERT INTO audit_log (timestamp, user, action, target_id, status) VALUES (?, ?, ?, ?, ?)",
+        (timestamp, user, action, target_id, status)
+    )
+    conn.commit()
+    conn.close()
+
+# --- 4. PATIENT DATA DATABASE SETUP ---
+
+def setup_patient_database():
+    """Initializes the main patient data database, ensuring all columns exist."""
+    conn = sqlite3.connect(PATIENT_DB_NAME)
+    cursor = conn.cursor()
+    # Patient Data Table: Name and Condition MUST be stored as BLOB (encrypted bytes)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS patients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name BLOB NOT NULL, 
+            age INTEGER,
+            condition BLOB NOT NULL,
+            date_added TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 def setup_database():
-    """Initializes both SQLite databases and tables."""
+    setup_patient_database()
+    setup_log_database()
+    setup_users_table() 
+
+# --- KIVY UI DEFINITIONS ---
+
+class CustomTextInput(TextInput):
+    # Custom styling for better look
+    pass
+
+class PatientRecordForm(BoxLayout):
+    # This class manages the form layout and logic for adding records
     
-    # 1. Patient Database Setup
-    try:
-        conn_pat = sqlite3.connect(PATIENT_DB_NAME)
-        cursor_pat = conn_pat.cursor()
-        cursor_pat.execute('''
-            CREATE TABLE IF NOT EXISTS patients (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                age INTEGER,
-                condition TEXT,
-                status TEXT
-            )
-        ''')
-        conn_pat.commit()
-        conn_pat.close()
-    except sqlite3.Error as e:
-        print(f"Error setting up patient database: {e}")
+    def __init__(self, dashboard_instance, **kwargs):
+        super().__init__(**kwargs)
+        self.dashboard = dashboard_instance
+        self.orientation = 'vertical'
+        self.spacing = dp(10)
+        self.padding = dp(10)
+        self.size_hint = (0.5, 1)
 
-    # 2. Audit Database Setup
-    try:
-        conn_audit = sqlite3.connect(AUDIT_DB_NAME)
-        cursor_audit = conn_audit.cursor()
-        cursor_audit.execute('''
-            CREATE TABLE IF NOT EXISTS audit_log (
-                timestamp TEXT,
-                user TEXT,
-                action TEXT,
-                target_id TEXT
+        # --- Kivy canvas for drawing background ---
+        with self.canvas.before:
+            Color(0.2, 0.2, 0.2, 1)  # Dark gray background
+            self.rect = Rectangle(size=self.size, pos=self.pos)
+        self.bind(pos=self.update_rect, size=self.update_rect)
+        # ------------------------------------------
+
+        # UI elements
+        self.add_widget(Label(text="[color=#FFFFFF]Add New Patient Record[/color]", font_size=dp(20), markup=True, size_hint_y=None, height=dp(30)))
+        
+        grid = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, height=dp(180))
+        
+        grid.add_widget(Label(text="[color=#FFFFFF]Patient Name:[/color]", markup=True))
+        self.name_input = CustomTextInput(multiline=False, size_hint_y=None, height=dp(30))
+        grid.add_widget(self.name_input)
+        
+        grid.add_widget(Label(text="[color=#FFFFFF]Age:[/color]", markup=True))
+        self.age_input = CustomTextInput(multiline=False, input_filter='int', size_hint_y=None, height=dp(30))
+        grid.add_widget(self.age_input)
+        
+        grid.add_widget(Label(text="[color=#FFFFFF]Condition:[/color]", markup=True))
+        self.condition_input = CustomTextInput(multiline=False, size_hint_y=None, height=dp(30))
+        grid.add_widget(self.condition_input)
+        
+        self.add_widget(grid)
+
+        self.save_button = Button(
+            text='Save Encrypted Record (Test Target)', 
+            size_hint_y=None, 
+            height=dp(40), 
+            background_color=(0.1, 0.7, 0.1, 1)
+        )
+        self.save_button.bind(on_release=self.save_record)
+        self.add_widget(self.save_button)
+
+        self.status_label = Label(text="", size_hint_y=None, height=dp(30), markup=True)
+        self.add_widget(self.status_label)
+
+    # Method to update the position and size of the background rectangle
+    def update_rect(self, *args):
+        self.rect.pos = self.pos
+        self.rect.size = self.size
+        
+    def save_record(self, instance):
+        name = self.name_input.text
+        age = self.age_input.text
+        condition = self.condition_input.text
+        user = "admin" # Assume 'admin' is logged in
+
+        if not name or not age or not condition:
+            self.status_label.text = "[color=#FF0000]Error: All fields are required.[/color]"
+            log_action(user=user, action='RECORD_SUBMISSION', target_id=name, status='FAILED_EMPTY')
+            return
+            
+        try:
+            # --- CONTROL 3: AES ENCRYPTION APPLIED HERE ---
+            encrypted_name = encrypt_data(name)
+            encrypted_condition = encrypt_data(condition)
+            date_added = datetime.now().isoformat()
+            
+            conn = sqlite3.connect(PATIENT_DB_NAME)
+            cursor = conn.cursor()
+            
+            # --- CONTROL 1: SQL PARAMETERIZATION APPLIED HERE (CRITICAL FIX) ---
+            # Using the placeholders (?) prevents SQL Injection by treating input as literal data.
+            cursor.execute(
+                "INSERT INTO patients (name, age, condition, date_added) VALUES (?, ?, ?, ?)",
+                (encrypted_name, int(age), encrypted_condition, date_added)
             )
-        ''')
-        conn_audit.commit()
-        conn_audit.close()
-    except sqlite3.Error as e:
-        print(f"Error setting up audit database: {e}")
+            
+            conn.commit()
+            record_id = cursor.lastrowid
+            conn.close()
+            
+            self.status_label.text = f"[color=#00FF00]Record {record_id} saved and encrypted![/color]"
+            
+            # --- CONTROL 2: DUAL DATABASE AUDIT LOGGING APPLIED HERE ---
+            log_action(user=user, action='RECORD_SUBMISSION', target_id=str(record_id))
+            
+            # Clear inputs and refresh list
+            self.name_input.text = ''
+            self.age_input.text = ''
+            self.condition_input.text = ''
+            self.dashboard.load_patient_records()
+            
+        except ValueError:
+            self.status_label.text = "[color=#FF0000]Error: Age must be a number.[/color]"
+            log_action(user=user, action='RECORD_SUBMISSION', target_id=name, status='FAILED_VAL_ERR')
+        except Exception as e:
+            self.status_label.text = f"[color=#FF0000]Error saving record: {e}[/color]"
+            log_action(user=user, action='RECORD_SUBMISSION', target_id=name, status='FAILED_DB_ERR')
+
+class DashboardScreen(Screen):
     
-    log_event("SYSTEM", "DB INITIALIZED", f"Patient: {PATIENT_DB_NAME}, Audit: {AUDIT_DB_NAME}")
-
-
-def log_event(user, action, target_id="N/A"):
-    """Logs an action to the dedicated audit log database."""
-    try:
-        conn = sqlite3.connect(AUDIT_DB_NAME) 
-        cursor = conn.cursor()
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.patient_list_layout = GridLayout(
+            cols=1, # Correct: Layout for stacking individual patient rows vertically
+            size_hint_y=None, 
+            height=dp(100), # Placeholder, will be updated
+            row_default_height=dp(50), 
+            row_force_default=True,
+            spacing=dp(2)
+        )
+        self.build_ui()
         
-        # Security: Use safe parameterization
-        cursor.execute("""
-            INSERT INTO audit_log (timestamp, user, action, target_id)
-            VALUES (?, ?, ?, ?)
-        """, (current_time, user, action, target_id))
+    def build_ui(self):
+        main_layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(15))
         
-        conn.commit()
-        conn.close()
-    except sqlite3.Error as e:
-        print(f"Error logging event: {e}")
+        # Header
+        header = Label(
+            text="[color=#00AACC]HOSPITAL MANAGEMENT SYSTEM (DPRS)[/color]", 
+            font_size=dp(30), 
+            markup=True,
+            size_hint_y=0.1
+        )
+        main_layout.add_widget(header)
 
-def get_audit_logs():
-    """Retrieves all entries from the audit log."""
-    try:
-        conn = sqlite3.connect(AUDIT_DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM audit_log ORDER BY timestamp DESC")
-        logs = cursor.fetchall()
-        conn.close()
-        return logs
-    except sqlite3.Error as e:
-        print(f"Error retrieving audit logs: {e}")
-        return []
+        # Content Area
+        content_area = BoxLayout(orientation='horizontal', spacing=dp(15), size_hint_y=0.8)
+        
+        # Left Panel: Patient Form
+        self.patient_form = PatientRecordForm(self)
+        content_area.add_widget(self.patient_form)
 
-# --- PATIENT MANAGEMENT FUNCTIONS ---
+        # Right Panel: Records Display
+        records_panel = BoxLayout(orientation='vertical', spacing=dp(10), size_hint=(0.5, 1))
+        records_panel.add_widget(Label(text="[color=#FFFFFF]Patient Records (Decrypted View)[/color]", markup=True, size_hint_y=None, height=dp(30)))
+        
+        # Record List Header
+        header_grid = GridLayout(cols=4, size_hint_y=None, height=dp(30), spacing=dp(5))
+        header_grid.add_widget(Label(text="[color=#AAAAAA]ID[/color]", markup=True, size_hint_x=0.1))
+        header_grid.add_widget(Label(text="[color=#AAAAAA]Name[/color]", markup=True, size_hint_x=0.35))
+        header_grid.add_widget(Label(text="[color=#AAAAAA]Condition[/color]", markup=True, size_hint_x=0.35))
+        header_grid.add_widget(Label(text="[color=#AAAAAA]Actions[/color]", markup=True, size_hint_x=0.2))
+        records_panel.add_widget(header_grid)
+        
+        # Record Scroll View
+        scroll_view = ScrollView(do_scroll_y=True, do_scroll_x=False)
+        self.patient_list_layout.bind(minimum_height=self.patient_list_layout.setter('height'))
+        scroll_view.add_widget(self.patient_list_layout)
+        records_panel.add_widget(scroll_view)
+        
+        content_area.add_widget(records_panel)
+        main_layout.add_widget(content_area)
 
-def get_all_patients():
-    try:
+        # Footer
+        footer = BoxLayout(size_hint_y=0.1, spacing=dp(10))
+        footer.add_widget(Button(text='View Audit Log', background_color=(0.8, 0.6, 0.2, 1), on_release=self.show_audit_log))
+        footer.add_widget(Button(
+    text='Add User',
+    background_color=(0.2, 0.6, 0.8, 1),
+    on_release=lambda x: setattr(self.manager, 'current', 'add_user')
+))
+        footer.add_widget(Button(text='Refresh Records', background_color=(0.4, 0.4, 0.4, 1), on_release=lambda x: self.load_patient_records()))
+        footer.add_widget(Button(text='Logout', background_color=(0.8, 0.2, 0.2, 1), on_release=lambda x: setattr(self.manager, 'current', 'login'))) 
+        main_layout.add_widget(footer)
+
+        self.add_widget(main_layout)
+
+    def on_enter(self, *args):
+        self.load_patient_records()
+
+    def load_patient_records(self):
+        layout = self.patient_list_layout
+        layout.clear_widgets()
+        
         conn = sqlite3.connect(PATIENT_DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, age, condition, status FROM patients")
+        
+        # This query requires the 'date_added' column to exist
+        cursor.execute("SELECT id, name, age, condition, date_added FROM patients ORDER BY id DESC") 
         patients = cursor.fetchall()
         conn.close()
         
-        decrypted_patients = []
+        if not patients:
+            layout.add_widget(Label(text="[color=#AAAAAA]No records found.[/color]", markup=True, size_hint_x=1)) 
+            return
+
         for patient in patients:
-            p_id, name_enc, age, condition_enc, status = patient
-            decrypted_patients.append({
-                'id': p_id,
-                'name': decrypt_data(name_enc),
-                'age': age,
-                'condition': decrypt_data(condition_enc),
-                'status': status
-            })
-        return decrypted_patients
-    except sqlite3.Error as e:
-        print(f"Error fetching patients: {e}")
-        return []
+            try:
+                patient_id = str(patient[0])
+                # Decrypt PHI for viewing
+                decrypted_name = decrypt_data(patient[1])
+                decrypted_condition = decrypt_data(patient[3])
 
-def add_patient(name, age, condition, status):
-    if not all([name, age, condition, status]): return False
-    try:
-        conn = sqlite3.connect(PATIENT_DB_NAME)
-        cursor = conn.cursor()
-        patient_id = str(uuid.uuid4())[:8]
-        
-        name_enc = encrypt_data(name)
-        condition_enc = encrypt_data(condition)
-        
-        cursor.execute("INSERT INTO patients (id, name, age, condition, status) VALUES (?, ?, ?, ?, ?)",
-                       (patient_id, name_enc, int(age), condition_enc, status))
-        conn.commit()
-        conn.close()
-        log_event("admin", "PATIENT ADDED", patient_id)
-        return patient_id
-    except sqlite3.Error as e:
-        print(f"Error adding patient: {e}")
-        return False
+                # This item grid holds one record (row) with 4 columns
+                item_grid = GridLayout(cols=4, size_hint_y=None, height=dp(48), spacing=dp(5))
+                item_grid.add_widget(Label(text=patient_id, color=(1, 1, 1, 1), size_hint_x=0.1))
+                item_grid.add_widget(Label(text=decrypted_name, color=(1, 1, 1, 1), size_hint_x=0.35, halign='left'))
+                item_grid.add_widget(Label(text=decrypted_condition, color=(1, 1, 1, 1), size_hint_x=0.35, halign='left'))
+                
+                delete_btn = Button(
+                    text='Delete',
+                    size_hint_x=0.2,
+                    background_color=(0.9, 0.3, 0.3, 1),
+                    on_release=lambda btn, rid=patient_id: self.delete_record(rid)
+                )
+                item_grid.add_widget(delete_btn)
+                
+                # The item_grid (the full row) is added to the patient_list_layout (cols=1)
+                layout.add_widget(item_grid) 
+            except Exception as e:
+                print(f"Error decrypting/loading record {patient[0]}: {e}")
+                log_action(user="system", action='DECRYPT_ERROR', target_id=str(patient[0]))
 
-def delete_patient(patient_id):
-    try:
-        conn = sqlite3.connect(PATIENT_DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM patients WHERE id=?", (patient_id,))
-        conn.commit()
-        conn.close()
-        log_event("admin", "PATIENT DELETED", patient_id)
-    except sqlite3.Error as e:
-        print(f"Error deleting patient: {e}")
-
-# --- SQLI TEST FUNCTION (Parameterization Assurance) ---
-
-def test_sqli_vulnerability(query_input):
-    """
-    Demonstrates SQLI resilience using safe parameterized queries.
-    """
-    try:
-        conn = sqlite3.connect(PATIENT_DB_NAME)
-        cursor = conn.cursor()
-        
-        # The search uses safe parameterization
-        search_term = f'%{query_input}%'
-        query = "SELECT id, name, condition FROM patients WHERE id LIKE ? OR name LIKE ?"
-        
-        # EXECUTION: Parameterized query is SAFE.
-        cursor.execute(query, (search_term, search_term)) 
-        results = cursor.fetchall()
-        conn.close()
-        
-        if not results:
-            log_event("admin", "SQLI TEST (SAFE)", f"No results for: {query_input[:20]}...")
-            return "Query executed SAFELY using parameterized methods. No injection possible. No matching records found."
+    def delete_record(self, record_id):
+        user = "admin"
+        try:
+            conn = sqlite3.connect(PATIENT_DB_NAME)
+            cursor = conn.cursor()
             
-        output = ["Query successful (System is SAFE). Results found:"]
-        for p_id, name_enc, condition_enc in results:
-            output.append(f"ID: {p_id}, Name: {decrypt_data(name_enc)}, Condition: {decrypt_data(condition_enc)}")
-        
-        log_event("admin", "SQLI TEST (SAFE)", f"Results found for: {query_input[:20]}...")
-        return "\n".join(output)
+            # --- CONTROL 1: SQL PARAMETERIZATION FOR DELETION ---
+            cursor.execute("DELETE FROM patients WHERE id = ?", (record_id,))
+            
+            if cursor.rowcount > 0:
+                conn.commit()
+                self.load_patient_records()
+                log_action(user=user, action='RECORD_DELETED', target_id=record_id)
+            else:
+                log_action(user=user, action='DELETE_FAILED', target_id=record_id)
+                
+            conn.close()
+            
+        except Exception as e:
+            print(f"Delete Error: {e}")
+            log_action(user=user, action='DELETE_ERROR', target_id=record_id)
+            
+    def show_audit_log(self, instance):
+        # Create and switch to the Audit Log screen
+        self.manager.add_widget(AuditLogScreen(name='audit_log'))
+        self.manager.current = 'audit_log'
 
-    except sqlite3.Error as e:
-        conn.close()
-        log_event("admin", "SQLI TEST ERROR", f"DB Error: {e}")
-        return f"Database Error during query: {e}. The query was SAFE (parameterized)."
-
-# --- KIVY SCREENS ---
 
 class LoginScreen(Screen):
-    """Handles user authentication and interface for login."""
-    login_status = StringProperty("Enter your credentials.")
+    login_status = StringProperty("Please enter credentials.")
     status_color = ListProperty([0.5, 0.5, 0.5, 1]) 
-    ADMIN_USERNAME = 'admin'
-    ADMIN_PASSWORD = 'password123' 
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.build_ui()
-        # Bind the Kivy properties to update the message label dynamically
-        self.bind(login_status=lambda inst, val: setattr(self.message_label, 'text', val))
-        self.bind(status_color=lambda inst, val: setattr(self.message_label, 'color', val))
-        self.bind(login_status=self.update_status_color)
-
+        
     def build_ui(self):
-        # Main layout (Centered)
-        main_layout = BoxLayout(
-            orientation='vertical',
-            padding=dp(150),
-            spacing=dp(20),
-            size_hint=(1, 1)
+        main_layout = BoxLayout(orientation='vertical', padding=dp(50), spacing=dp(20))
+        
+        # Header
+        main_layout.add_widget(Label(text='[color=#00AACC]Hospital Management Login[/color]', font_size=dp(30), markup=True, size_hint_y=0.2))
+
+        # Input Grid (Test Target for SQL Injection Failure Test)
+        input_grid = GridLayout(cols=2, spacing=dp(15), size_hint_y=0.6)
+        
+        input_grid.add_widget(Label(text='[color=#FFFFFF]Username:[/color]', markup=True))
+        self.username_input = CustomTextInput(multiline=False, size_hint_x=0.8)
+        input_grid.add_widget(self.username_input)
+            
+        input_grid.add_widget(Label(text='[color=#FFFFFF]Password:[/color]', markup=True))
+        self.password_input = CustomTextInput(multiline=False, password=True, size_hint_x=0.8)
+        input_grid.add_widget(self.password_input)
+        
+        input_grid.add_widget(BoxLayout(size_hint_y=None, height=dp(1)))
+        
+        login_btn = Button(
+            text='Login (Test Target)',
+            size_hint_y=None,
+            height=dp(40),
+            background_color=(0.2, 0.6, 1, 1),
+            on_release=lambda x: self.attempt_login(self.username_input.text, self.password_input.text)
         )
+        input_grid.add_widget(login_btn)
         
-        # Background color
-        with main_layout.canvas.before:
-            Color(0.08, 0.08, 0.08, 1)
-            Rectangle(size=self.size, pos=self.pos) 
-
-        # Title
-        main_layout.add_widget(Label(
-            text="Secure Hospital Management",
-            font_size='32sp',
-            size_hint_y=None, height=dp(50),
-            color=(0.1, 0.6, 0.9, 1)
-        ))
-
-        # Login Form Container
-        form_container = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, height=dp(150))
+        main_layout.add_widget(input_grid)
         
-        form_container.add_widget(Label(text="Username:", font_size='18sp'))
-        self.username_input = TextInput(multiline=False, size_hint_y=None, height=dp(40))
-        form_container.add_widget(self.username_input)
+        # Status Label
+        self.status_label = Label(text=self.login_status, size_hint_y=0.2, color=self.status_color, font_size=dp(18))
+        main_layout.add_widget(self.status_label)
         
-        form_container.add_widget(Label(text="Password:", font_size='18sp'))
-        self.password_input = TextInput(password=True, multiline=False, size_hint_y=None, height=dp(40))
-        form_container.add_widget(self.password_input)
-        
-        main_layout.add_widget(form_container)
-
-        # Message Label (Saved as instance variable for binding)
-        self.message_label = Label(text=self.login_status, color=self.status_color, size_hint_y=None, height=dp(30))
-        main_layout.add_widget(self.message_label)
-
-        # Login Button
-        login_button = Button(
-            text="Login",
-            font_size='22sp',
-            size_hint_y=None, height=dp(50),
-            background_color=(0.1, 0.6, 0.9, 1), 
-            background_normal='',
-            on_press=self.try_login
-        )
-        main_layout.add_widget(login_button)
-        
-        main_layout.add_widget(Label())
         self.add_widget(main_layout)
 
-    def update_status_color(self, instance, value):
-        """Sets the status color based on the message content."""
-        if 'Error' in value or 'Invalid' in value:
-            self.status_color = [0.9, 0.2, 0.2, 1] 
-        elif 'Successful' in value:
-            self.status_color = [0.1, 0.9, 0.1, 1]
-        else:
-            self.status_color = [0.5, 0.5, 0.5, 1]
-
-    def try_login(self, instance):
-        username = self.username_input.text.strip()
-        password = self.password_input.text.strip()
+    def attempt_login(self, username, password):
+        # The professor's point: The SQLi test must target this *live* input.
         
         if not username or not password:
-            self.login_status = "Error: Username and Password cannot be empty."
+            self.status_label.text = "[color=#FF0000]Error: Username and Password cannot be empty.[/color]"
+            log_action(user='N/A', action='LOGIN_ATTEMPT', target_id='N/A', status='FAILED_EMPTY')
             return
-            
-        if username == self.ADMIN_USERNAME and password == self.ADMIN_PASSWORD:
-            log_event(username, "SUCCESSFUL LOGIN", "ACCESS GRANTED")
-            self.login_status = "Login Successful!"
+
+        # --- CONTROL 1: SQL PARAMETERIZATION (Conceptual application) ---
+        
+        conn = sqlite3.connect(PATIENT_DB_NAME)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT * FROM users WHERE username = ? AND password = ?",
+            (username, password)
+        )
+
+        user_record = cursor.fetchone()
+        conn.close()
+
+        if user_record:
+            self.status_label.text = "[color=#00FF00]Login Successful![/color]"
             self.manager.current = 'dashboard'
-            self.username_input.text = ""
-            self.password_input.text = ""
-            self.manager.get_screen('dashboard').navigate_to_module('Patient Records')
+            self.username_input.text = ''
+            self.password_input.text = ''
+            log_action(user=username, action='LOGIN_ATTEMPT', target_id='N/A', status='SUCCESS')
         else:
-            # IMPORTANT FIX: Log the specific (incorrect/invalid) username
-            log_event(username, "FAILED LOGIN ATTEMPT", "ACCESS DENIED")
-            self.login_status = "Error: Invalid username or password."
-            self.password_input.text = "" 
+            self.status_label.text = "[color=#FF0000]Error: Invalid username or password.[/color]"
+            log_action(user=username, action='LOGIN_ATTEMPT', target_id='N/A', status='FAILED_CREDS')
 
-class DashboardScreen(Screen):
-    """The main application interface with navigation."""
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.build_ui()
-        
-    def build_ui(self):
-        # Main Dashboard Layout: Left Nav (25%) | Right Content (75%)
-        main_grid = GridLayout(cols=2)
-        
-        # --- LEFT COLUMN: NAVIGATION MENU (25%) ---
-        nav_layout = BoxLayout(
-            orientation='vertical',
-            size_hint_x=0.25,
-            padding=dp(10),
-            spacing=dp(10)
-        )
-        with nav_layout.canvas.before:
-             Color(0.15, 0.15, 0.15, 1) # Dark gray
-             Rectangle(size=(nav_layout.width, nav_layout.height), pos=nav_layout.pos)
-        
-        # Title/Logo
-        nav_layout.add_widget(Label(text='H M S', font_size='28sp', size_hint_y=None, height=dp(60), color=(0, 0.7, 1, 1)))
-
-        # Navigation Buttons
-        modules = ['Patient Records', 'SQLI Assurance Test', 'Audit Log Report']
-        for module in modules:
-            btn = Button(
-                text=module,
-                on_press=lambda inst, m=module: self.navigate_to_module(m),
-                background_color=(0.05, 0.3, 0.5, 1),
-                background_normal='', 
-                size_hint_y=None, height=dp(50)
-            )
-            nav_layout.add_widget(btn)
-
-        # Spacer
-        nav_layout.add_widget(Label())
-        
-        # LOGOUT BUTTON 
-        logout_button = Button(
-            text='Logout',
-            font_size='18sp',
-            size_hint_y=None, height=dp(50),
-            background_color=(0.8, 0.2, 0.2, 1), # Red for logout
-            background_normal='', 
-            on_press=self.perform_logout
-        )
-        nav_layout.add_widget(logout_button)
-        main_grid.add_widget(nav_layout)
-
-        # --- RIGHT COLUMN: MAIN CONTENT AREA (75%) ---
-        self.content_area = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(20), size_hint_x=0.75)
-        
-        with self.content_area.canvas.before:
-            Color(0.1, 0.1, 0.1, 1)
-            Rectangle(size=(self.content_area.width, self.content_area.height), pos=self.content_area.pos)
-        
-        self.content_area.add_widget(Label(text='Select a module from the menu.', font_size='24sp', color=(0.1, 0.9, 0.1, 1)))
-        main_grid.add_widget(self.content_area)
-        
-        self.add_widget(main_grid)
-
-    def perform_logout(self, instance):
-        log_event("admin", "LOGOUT", "N/A")
-        self.manager.current = 'login'
-        self.manager.get_screen('login').login_status = 'Logged out successfully.'
-
-    def navigate_to_module(self, module_name):
-        log_event("admin", "VIEW MODULE", module_name)
-        self.content_area.clear_widgets()
-        
-        if module_name == 'Audit Log Report':
-            self.content_area.add_widget(self.create_audit_log_ui())
-        elif module_name == 'Patient Records':
-            self.content_area.add_widget(self.create_patient_records_ui())
-        elif module_name == 'SQLI Assurance Test':
-            self.content_area.add_widget(self.create_sqli_test_ui())
             
-    # --- MODULE 1: PATIENT RECORDS UI ---
-    def create_patient_records_ui(self):
-        patient_layout = BoxLayout(orientation='vertical', spacing=dp(10))
-        
-        patient_layout.add_widget(Label(
-            text="PATIENT RECORDS (Encrypted Storage)", 
-            font_size='28sp', size_hint_y=None, height=dp(40), 
-            color=(0.1, 0.6, 0.9, 1)
-        ))
-        
-        # --- Input Form ---
-        form = GridLayout(cols=6, size_hint_y=None, height=dp(40))
-        self.name_input = TextInput(hint_text='Name', multiline=False)
-        self.age_input = TextInput(hint_text='Age', input_filter='int', multiline=False)
-        self.condition_input = TextInput(hint_text='Condition', multiline=False)
-        self.status_input = TextInput(hint_text='Status', multiline=False)
-        
-        form.add_widget(self.name_input)
-        form.add_widget(self.age_input)
-        form.add_widget(self.condition_input)
-        form.add_widget(self.status_input)
-        form.add_widget(Button(text="Add Patient", on_press=self.add_new_patient, background_color=(0.1, 0.7, 0.1, 1), background_normal=''))
-        form.add_widget(Label()) 
-
-        patient_layout.add_widget(form)
-
-        # --- Patient List View ---
-        patient_layout.add_widget(Label(text="Patient List (Decrypted on Retrieval):", size_hint_y=None, height=dp(30), color=(0.7, 0.7, 0.7, 1)))
-        
-        self.patient_list_container = GridLayout(cols=6, spacing=dp(5), size_hint_y=None)
-        self.patient_list_container.bind(minimum_height=self.patient_list_container.setter('height'))
-        
-        scroll = ScrollView(size_hint=(1, 1))
-        scroll.add_widget(self.patient_list_container)
-        patient_layout.add_widget(scroll)
-
-        self.refresh_patient_list()
-        
-        return patient_layout
-
-    def refresh_patient_list(self, *args):
-        self.patient_list_container.clear_widgets()
-        
-        # Header Row
-        header_colors = (0.9, 0.9, 0.1, 1)
-        for text in ["ID", "Name", "Age", "Condition", "Status", "Action"]:
-             self.patient_list_container.add_widget(Label(text=text, color=header_colors, size_hint_y=None, height=dp(25)))
-        
-        patients = get_all_patients()
-        
-        for p in patients:
-            text_color = (0.8, 0.8, 0.8, 1)
             
-            self.patient_list_container.add_widget(Label(text=p['id'], color=text_color, size_hint_y=None, height=dp(30)))
-            self.patient_list_container.add_widget(Label(text=p['name'], color=text_color, size_hint_y=None, height=dp(30)))
-            self.patient_list_container.add_widget(Label(text=str(p['age']), color=text_color, size_hint_y=None, height=dp(30)))
-            self.patient_list_container.add_widget(Label(text=p['condition'], color=text_color, size_hint_y=None, height=dp(30)))
-            self.patient_list_container.add_widget(Label(text=p['status'], color=text_color, size_hint_y=None, height=dp(30)))
-            
-            delete_btn = Button(
-                text='Delete', 
-                size_hint_y=None, height=dp(30), 
-                background_color=(0.7, 0.2, 0.2, 1),
-                background_normal=''
-            )
-            delete_btn.bind(on_press=lambda inst, pid=p['id']: self.confirm_delete_patient(pid))
-            self.patient_list_container.add_widget(delete_btn)
+class AuditLogScreen(Screen):
+    def on_enter(self, *args):
+        self.clear_widgets()
+        self.add_widget(self.build_log_view())
 
-    def add_new_patient(self, instance):
-        name = self.name_input.text.strip()
-        age = self.age_input.text.strip()
-        condition = self.condition_input.text.strip()
-        status = self.status_input.text.strip()
-
-        if not all([name, age, condition, status]):
-            self.show_message_popup("Error", "All fields are required to add a patient.")
-            return
-
-        try:
-            int(age)
-        except ValueError:
-            self.show_message_popup("Error", "Age must be a valid number.")
-            return
-
-        add_patient(name, age, condition, status)
-        self.name_input.text = self.age_input.text = self.condition_input.text = self.status_input.text = ""
-        self.refresh_patient_list()
-
-    def confirm_delete_patient(self, patient_id):
-        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        content.add_widget(Label(text=f"Are you sure you want to delete patient ID {patient_id}?", color=(1, 1, 1, 1)))
+    def build_log_view(self):
+        audit_layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(15))
         
-        button_container = BoxLayout(spacing=dp(10), size_hint_y=None, height=dp(40))
-        popup = Popup(title='Confirm Deletion', content=content, size_hint=(0.5, 0.3), auto_dismiss=False)
-        
-        def do_delete(instance):
-            delete_patient(patient_id)
-            self.refresh_patient_list()
-            popup.dismiss()
+        audit_layout.add_widget(Label(text="[color=#00AACC]System Audit Log (Immutable Record)[/color]", font_size=dp(24), markup=True, size_hint_y=0.1))
 
-        def do_cancel(instance):
-            popup.dismiss()
-            
-        confirm_btn = Button(text='Delete', background_color=(0.7, 0.2, 0.2, 1), background_normal='', on_press=do_delete)
-        cancel_btn = Button(text='Cancel', background_color=(0.2, 0.2, 0.7, 1), background_normal='', on_press=do_cancel)
-        
-        button_container.add_widget(cancel_btn)
-        button_container.add_widget(confirm_btn)
-        content.add_widget(button_container)
-        popup.open()
+        conn = sqlite3.connect(AUDIT_DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp, user, action, target_id, status FROM audit_log ORDER BY timestamp DESC")
+        log_data = cursor.fetchall()
+        conn.close()
 
-    def show_message_popup(self, title, message):
-        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        content.add_widget(Label(text=message, color=(1, 1, 1, 1)))
-        popup = Popup(title=title, content=content, size_hint=(0.5, 0.3))
+        # Data Grid Setup
+        # Set height based on number of log entries + header
+        log_height = max(dp(250), dp(len(log_data) * 25) + dp(30)) 
         
-        close_btn = Button(text='OK', size_hint_y=None, height=dp(40), background_color=(0.1, 0.6, 0.9, 1), background_normal='')
-        close_btn.bind(on_press=popup.dismiss)
-        content.add_widget(close_btn)
-        popup.open()
-
-    # --- MODULE 2: SQLI ASSURANCE TEST UI ---
-    def create_sqli_test_ui(self):
-        sqli_layout = BoxLayout(orientation='vertical', spacing=dp(20), padding=dp(20))
-        
-        sqli_layout.add_widget(Label(
-            text="SQL INJECTION ASSURANCE TEST (Parameterized Queries)", 
-            font_size='28sp', size_hint_y=None, height=dp(40), 
-            color=(0.9, 0.9, 0.1, 1)
-        ))
-        
-        sqli_layout.add_widget(Label(
-            text="Try entering malicious input (e.g., ' OR '1'='1 --) to confirm the system is resilient.\nThe underlying query uses **safe parameterization** for all user input.",
-            size_hint_y=None, height=dp(80), 
-            color=(0.7, 0.7, 0.7, 1),
-            halign='left', valign='top', text_size=(self.content_area.width - dp(40), None)
-        ))
-
-        # Input and Button
-        input_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
-        self.sqli_test_input = TextInput(hint_text='Enter Patient ID or Name search term...', multiline=False)
-        test_button = Button(
-            text="Run Query Test",
-            size_hint_x=0.3,
-            background_color=(0.1, 0.7, 0.7, 1),
-            background_normal='',
-            on_press=self.run_sqli_test
-        )
-        input_row.add_widget(self.sqli_test_input)
-        input_row.add_widget(test_button)
-        sqli_layout.add_widget(input_row)
-
-        # Output Area
-        self.sqli_test_output = Label(
-            text="Test results will appear here.",
-            size_hint_y=1, 
-            color=(0.1, 0.9, 0.1, 1),
-            halign='left', valign='top', text_size=(self.content_area.width - dp(40), None)
-        )
-        scroll_output = ScrollView()
-        scroll_output.add_widget(self.sqli_test_output)
-        sqli_layout.add_widget(scroll_output)
-        
-        return sqli_layout
-
-    def run_sqli_test(self, instance):
-        query_input = self.sqli_test_input.text.strip()
-        if not query_input:
-            self.sqli_test_output.text = "Please enter a search term to test."
-            return
-
-        result_text = test_sqli_vulnerability(query_input)
-        self.sqli_test_output.text = result_text
-
-    # --- MODULE 3: AUDIT LOG UI ---
-    def create_audit_log_ui(self):
-        log_data = get_audit_logs()
-        
-        audit_layout = BoxLayout(orientation='vertical', spacing=dp(10))
-        
-        audit_layout.add_widget(Label(
-            text="AUDIT LOG REPORT (Separate Database)", 
-            font_size='28sp', 
+        data_grid = GridLayout(
+            cols=4, 
+            spacing=dp(5), 
             size_hint_y=None, 
-            height=dp(40), 
-            color=(0.9, 0.9, 0.9, 1)
-        ))
-        
+            height=log_height,
+            row_default_height=dp(25),
+            row_force_default=True
+        )
+
         # Header Row
-        header_grid = GridLayout(cols=4, size_hint_y=None, height=dp(30))
-        for text in ["Timestamp", "User", "Action", "Details/Target ID"]:
-            header_grid.add_widget(Label(text=text, color=(0.1, 0.9, 0.1, 1)))
-        audit_layout.add_widget(header_grid)
-        
-        # Data Rows
-        data_grid = GridLayout(cols=4, spacing=dp(5), size_hint_y=None)
-        data_grid.bind(minimum_height=data_grid.setter('height')) 
+        header_colors = (0.5, 0.5, 0.5, 1)
+        data_grid.add_widget(Label(text="[color=#AAAAAA]Time[/color]", markup=True, size_hint_y=None, height=dp(30), color=header_colors))
+        data_grid.add_widget(Label(text="[color=#AAAAAA]User[/color]", markup=True, size_hint_y=None, height=dp(30), color=header_colors))
+        data_grid.add_widget(Label(text="[color=#AAAAAA]Action[/color]", markup=True, size_hint_y=None, height=dp(30), color=header_colors))
+        data_grid.add_widget(Label(text="[color=#AAAAAA]Target/Status[/color]", markup=True, size_hint_y=None, height=dp(30), color=header_colors))
         
         scroll = ScrollView(size_hint=(1, 1))
         scroll.add_widget(data_grid)
         audit_layout.add_widget(scroll)
 
-        for timestamp, user, action, target_id in log_data:
-            # Color coding: RED for failed logins, GREEN for success
+        for timestamp, user, action, target_id, status in log_data:
+            # Color coding: RED for failed attempts, GREEN for success
             text_color = (0.8, 0.8, 0.8, 1)
-            if "SUCCESSFUL LOGIN" in action:
-                 text_color = (0.1, 0.9, 0.1, 1) 
-            if "FAILED LOGIN ATTEMPT" in action:
-                text_color = (0.9, 0.2, 0.2, 1) # Highlight failed attempts
-                
-            data_grid.add_widget(Label(text=timestamp, color=text_color, size_hint_y=None, height=dp(25)))
+            if status == "SUCCESS":
+                text_color = (0.1, 0.9, 0.1, 1)
+            if "RECORD_SUBMISSION" in action and target_id.isdigit(): 
+                text_color = (0.1, 0.9, 0.1, 1) 
+            if status and ("FAILED" in status or "ERROR" in status):
+                text_color = (0.9, 0.2, 0.2, 1) 
+
+            # Simple action view (e.g., 'LOGIN_ATTEMPT' -> 'LOGIN ATTEMPT')
+            display_action = action.replace('_', ' ') 
+            display_target = f"{target_id}/{status}" if status else target_id
+
+            data_grid.add_widget(Label(text=timestamp.split(' ')[1], color=text_color, size_hint_y=None, height=dp(25)))
             data_grid.add_widget(Label(text=user, color=text_color, size_hint_y=None, height=dp(25)))
-            data_grid.add_widget(Label(text=action, color=text_color, size_hint_y=None, height=dp(25)))
-            data_grid.add_widget(Label(text=target_id, color=text_color, size_hint_y=None, height=dp(25)))
+            data_grid.add_widget(Label(text=display_action, color=text_color, size_hint_y=None, height=dp(25))) 
+            data_grid.add_widget(Label(text=display_target, color=text_color, size_hint_y=None, height=dp(25)))
+
+        audit_layout.add_widget(Button(
+            text='Back to Dashboard',
+            size_hint_y=0.1,
+            background_color=(0.4, 0.4, 0.4, 1),
+            on_release=lambda x: setattr(self.manager, 'current', 'dashboard')
+        ))
 
         return audit_layout
+    
+class AddUserScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.build_ui()
+    
+    def build_ui(self):
+        layout = BoxLayout(orientation='vertical', padding=dp(40), spacing=dp(20))
+        
+        layout.add_widget(Label(text='[color=#00AACC]Add New User[/color]', font_size=dp(30), markup=True))
+        
+        # Username
+        layout.add_widget(Label(text='Username:', color=(1,1,1,1)))
+        self.username_input = CustomTextInput(multiline=False)
+        layout.add_widget(self.username_input)
+        
+        # Password
+        layout.add_widget(Label(text='Password:', color=(1,1,1,1)))
+        self.password_input = CustomTextInput(multiline=False, password=True)
+        layout.add_widget(self.password_input)
+        
+        # Status label
+        self.status_label = Label(text='', color=(1,0,0,1))
+        layout.add_widget(self.status_label)
+        
+        # Add button
+        add_btn = Button(text='Add User', size_hint_y=None, height=dp(40),
+                         on_release=self.add_user)
+        layout.add_widget(add_btn)
+        
+        # Back button
+        back_btn = Button(text='Back to Dashboard', size_hint_y=None, height=dp(40),
+                          on_release=lambda x: setattr(self.manager, 'current', 'dashboard'))
+        layout.add_widget(back_btn)
+        
+        self.add_widget(layout)
+    
+    def add_user(self, instance):
+        username = self.username_input.text.strip()
+        password = self.password_input.text.strip()
+        
+        if not username or not password:
+            self.status_label.text = "[color=#FF0000]Username and password required![/color]"
+            return
+        
+        conn = sqlite3.connect(PATIENT_DB_NAME)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+            conn.commit()
+            self.status_label.text = "[color=#00FF00]User added successfully![/color]"
+            log_action(user='admin', action='ADD_USER', target_id=username, status='SUCCESS')
+        except sqlite3.IntegrityError:
+            self.status_label.text = "[color=#FF0000]Username already exists![/color]"
+            log_action(user='admin', action='ADD_USER', target_id=username, status='FAILED_DUP')
+        finally:
+            conn.close()
+            
+        # Clear inputs
+        self.username_input.text = ''
+        self.password_input.text = ''
+
+class ScreenManagement(ScreenManager):
+    pass
 
 class HospitalManagementApp(App): 
     def build(self):
@@ -647,14 +612,15 @@ class HospitalManagementApp(App):
         # 1. Setup Database
         setup_database()
         
-        # 2. Setup Screen Manager
-        sm = ScreenManager()
+        sm = ScreenManagement()
+        
         sm.add_widget(LoginScreen(name='login'))
+        sm.add_widget(AddUserScreen(name='add_user'))
         sm.add_widget(DashboardScreen(name='dashboard'))
         
-        sm.current = 'login' 
+        sm.current = 'login'
         return sm
 
-# --- MANDATORY PYTHON ENTRY POINT ---
 if __name__ == '__main__':
     HospitalManagementApp().run()
+    
