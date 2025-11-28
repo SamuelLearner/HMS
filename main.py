@@ -239,6 +239,7 @@ class PatientRecordForm(BoxLayout):
             self.status_label.text = f"[color=#00FF00]Record {record_id} saved and encrypted![/color]"
             
             # --- CONTROL 2: DUAL DATABASE AUDIT LOGGING APPLIED HERE ---
+            user = App.get_running_app().current_user
             log_action(user=user, action='RECORD_SUBMISSION', target_id=str(record_id))
             
             # Clear inputs and refresh list
@@ -380,8 +381,10 @@ class DashboardScreen(Screen):
             if cursor.rowcount > 0:
                 conn.commit()
                 self.load_patient_records()
+                user = App.get_running_app().current_user
                 log_action(user=user, action='RECORD_DELETED', target_id=record_id)
             else:
+                user = App.get_running_app().current_user
                 log_action(user=user, action='DELETE_FAILED', target_id=record_id)
                 
             conn.close()
@@ -462,6 +465,7 @@ class LoginScreen(Screen):
         conn.close()
 
         if user_record:
+            App.get_running_app().current_user = username
             self.status_label.text = "[color=#00FF00]Login Successful![/color]"
             self.manager.current = 'dashboard'
             self.username_input.text = ''
